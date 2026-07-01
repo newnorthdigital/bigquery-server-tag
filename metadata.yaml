@@ -1,1 +1,5 @@
-homepage: https://github.com/newnorthdigital/bigquery-server-tag
+homepage: "https://newnorth.nl"
+documentation: "https://github.com/newnorthdigital/bigquery-server-tag/blob/main/README.md"
+versions:
+  - sha: REPLACE_WITH_COMMIT_SHA
+    changeNotes: "Self-referral attribution fix, retry log gating, event_date/timestamp alignment, manual geo/device override dedup, gallery metadata, test scenarios."

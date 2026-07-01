@@ -1,6 +1,6 @@
-# BigQuery Event Tag
+# BigQuery Event Tag by New North Digital
 
-A server-side Google Tag Manager (sGTM) tag template that streams events to BigQuery in a GA4-shaped schema. By [New North Digital](https://newnorth.nl).
+A server-side Google Tag Manager (sGTM) tag template that streams events to BigQuery in a GA4-shaped schema. Created and maintained by [Freek Kampen](https://freekkampen.com) at [New North Digital](https://newnorth.nl).
 
 It takes the incoming sGTM event, builds a row close to the GA4 BigQuery export shape (event params, user properties, device, geo, traffic attribution, privacy/consent), and writes it with `BigQuery.insert()`.
 

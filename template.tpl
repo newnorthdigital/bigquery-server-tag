@@ -13,7 +13,8 @@ ___INFO___
   "id": "cvt_temp_public_id",
   "version": 1,
   "securityGroups": [],
-  "displayName": "BigQuery Event Tag",
+  "displayName": "BigQuery Event Tag by New North Digital",
+  "categories": ["DATA_WAREHOUSING", "ANALYTICS"],
   "brand": {
     "id": "brand_dummy",
     "displayName": "New North Digital",
@@ -546,7 +547,9 @@ const stringContains = (str, substr) => {
   return str && substr && str.indexOf(substr) !== -1;
 };
 
-const formatDateForBigQuery = () => {
+// Falls back to the date of the row's own event_timestamp (not a fresh server
+// read) so event_date and event_timestamp can't disagree around midnight.
+const formatDateForBigQuery = (fallbackMillis) => {
   const eventDate = cache.eventDate;
   if (eventDate && getType(eventDate) === 'string') {
     if (eventDate.length === 10 && eventDate.indexOf('-') === 4) {
@@ -556,8 +559,7 @@ const formatDateForBigQuery = () => {
       return eventDate.substring(0, 4) + '-' + eventDate.substring(4, 6) + '-' + eventDate.substring(6, 8);
     }
   }
-  const currentTimestamp = getTimestampMillis();
-  const parsedDate = parseDate(currentTimestamp);
+  const parsedDate = parseDate(fallbackMillis);
   return parsedDate.year + '-' + parsedDate.month + '-' + parsedDate.day;
 };
 
@@ -686,7 +688,7 @@ const getUserPseudoId = (platform) => {
     if (appInstanceId) return convertToString(appInstanceId);
     if (cache.firebaseId) return convertToString(cache.firebaseId);
   }
-  return convertToString(cache.clientId || data.user_id || '(not set)');
+  return convertToString(cache.clientId || '(not set)');
 };
 
 // ============================================================================
@@ -782,6 +784,17 @@ const determineTrafficAttributes = () => {
   const referrerUrl = cache.pageReferrer;
   if (referrerUrl) {
     const referrerTLD = computeEffectiveTldPlusOne(referrerUrl);
+
+    // Self-referral: internal navigation must not become source=own-domain /
+    // medium=referral (GA4 ignores same-domain referrers). Only when BOTH
+    // eTLD+1 lookups succeed, so a failed lookup can't misclassify.
+    const pageTLD = cache.pageLocation ? computeEffectiveTldPlusOne(cache.pageLocation) : null;
+    if (referrerTLD && pageTLD && referrerTLD === pageTLD) {
+      result.source = '(direct)';
+      result.medium = '(none)';
+      return result;
+    }
+
     const parsedReferrer = parseUrl(referrerUrl);
     const referrerDomain = parsedReferrer ? parsedReferrer.hostname : null;
     
@@ -1134,10 +1147,12 @@ const resolveEventTimestampMicros = () => {
   return getTimestampMillis() * 1000;
 };
 
+const eventTimestampMicros = resolveEventTimestampMicros();
+
 // Build the row object
 const row = {
-  event_date: formatDateForBigQuery(),
-  event_timestamp: resolveEventTimestampMicros(),  // Microseconds
+  event_date: formatDateForBigQuery(eventTimestampMicros / 1000),
+  event_timestamp: eventTimestampMicros,  // Microseconds
   event_name: data.eventName,
   user_id: userId,
   ga_session_id: sessionInfo.sessionId,
@@ -1170,17 +1185,22 @@ if (data.eventDataFields) {
   extractEventParams(data.eventDataFields, row.event_params);
 }
 
-// Remove duplicates using object (O(1) lookup)
-const seenKeys = {};
-const uniqueEventParams = [];
-for (let i = row.event_params.length - 1; i >= 0; i--) {
-  const param = row.event_params[i];
-  if (!seenKeys[param.key]) {
-    seenKeys[param.key] = 1;
-    uniqueEventParams.unshift(param);
+// Remove duplicate keys, keeping the LAST occurrence so manually added
+// entries (appended after auto-detected ones) win. O(1) lookups via object.
+const dedupeByKey = (entries) => {
+  const seenKeys = {};
+  const unique = [];
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (!seenKeys[entry.key]) {
+      seenKeys[entry.key] = 1;
+      unique.unshift(entry);
+    }
   }
-}
-row.event_params = uniqueEventParams;
+  return unique;
+};
+
+row.event_params = dedupeByKey(row.event_params);
 
 // Process user properties
 const autoUserProperties = getAutoUserProperties();
@@ -1190,24 +1210,17 @@ if (data.userProperties && getType(data.userProperties) === 'array') {
   extractEventParams(data.userProperties, row.user_properties);
 }
 
-// Remove duplicates
-const seenUserKeys = {};
-const uniqueUserProperties = [];
-for (let i = row.user_properties.length - 1; i >= 0; i--) {
-  const prop = row.user_properties[i];
-  if (!seenUserKeys[prop.key]) {
-    seenUserKeys[prop.key] = 1;
-    uniqueUserProperties.unshift(prop);
-  }
-}
-row.user_properties = uniqueUserProperties;
+row.user_properties = dedupeByKey(row.user_properties);
 
-// Add manual geo/device properties
+// Add manual geo/device properties (deduped so a manual key overrides the
+// auto-detected value instead of appearing twice in the repeated record)
 if (data.geoProperties && getType(data.geoProperties) === 'array') {
   extractEventParams(data.geoProperties, row.geo);
+  row.geo = dedupeByKey(row.geo);
 }
 if (data.deviceProperties && getType(data.deviceProperties) === 'array') {
   extractEventParams(data.deviceProperties, row.device);
+  row.device = dedupeByKey(row.device);
 }
 
 // Connection info
@@ -1254,6 +1267,10 @@ data.gtmOnSuccess();
 // Now do the BigQuery insert in the background. CPU stays allocated on the
 // Cloud Run service (--no-cpu-throttling), so this completes after the response.
 // Retries once on failure to recover transient BigQuery errors (e.g. 503 / rate limit).
+// Known limits: the sandbox has no timer API, so the retry is immediate (no
+// backoff), and BigQuery.insert exposes no insertId, so a retry after a
+// timeout-shaped "failure" that actually landed can double-insert the row.
+// For analytics data a rare duplicate beats a lost event.
 const insertToBigQuery = (isRetry) => {
   BigQuery.insert(
     connectionInfo,
@@ -1266,9 +1283,15 @@ const insertToBigQuery = (isRetry) => {
       }
     },
     (errors) => {
-      // Failure callback - tag already marked as success
+      // Failure callback - tag already marked as success.
+      // Transient (first) failures log only in debug mode: at production
+      // volume an outage would otherwise flood stdout, which the Cloud
+      // Logging exclusion filter does NOT drop. The final failure logs
+      // unconditionally: the "BigQuery insert FAILED" alert matches it.
       if (!isRetry) {
-        log('BigQuery insert failed, retrying once (async):', JSON.stringify(errors));
+        if (data.consoleLog === true) {
+          log('BigQuery insert failed, retrying once (async):', JSON.stringify(errors));
+        }
         insertToBigQuery(true);
       } else {
         log('BigQuery insert FAILED after retry (async):', JSON.stringify(errors));
@@ -1391,11 +1414,92 @@ ___SERVER_PERMISSIONS___
 
 ___TESTS___
 
-scenarios: []
+scenarios:
+- name: Web purchase event inserts one row and fires success
+  code: |-
+    const mockData = {
+      bqProject: 'my-project',
+      bqDataset: 'analytics',
+      bqTable: 'events',
+      eventName: 'purchase',
+      defaultParametersToInclude: 'all',
+      defaultUserPropertiesToInclude: 'none',
+      defaultDevicePropertiesToInclude: 'all',
+      defaultGeoPropertiesToInclude: 'all'
+    };
+    mock('getAllEventData', {
+      event_name: 'purchase',
+      client_id: '123.456',
+      page_location: 'https://shop.example.com/checkout',
+      currency: 'EUR'
+    });
+    mock('getEventData', (key) => undefined);
+    let insertedRows;
+    mock('BigQuery', {
+      insert: (connection, rows, options, onSuccess, onFailure) => {
+        insertedRows = rows;
+        onSuccess();
+      }
+    });
+    runCode(mockData);
+    assertApi('gtmOnSuccess').wasCalled();
+    assertThat(insertedRows.length).isEqualTo(1);
+    assertThat(insertedRows[0].event_name).isEqualTo('purchase');
+    assertThat(insertedRows[0].user_pseudo_id).isEqualTo('123.456');
+- name: BigQuery failure retries exactly once and does not crash
+  code: |-
+    const mockData = {
+      bqProject: 'my-project',
+      bqDataset: 'analytics',
+      bqTable: 'events',
+      eventName: 'purchase'
+    };
+    mock('getAllEventData', { event_name: 'purchase', client_id: '123.456' });
+    mock('getEventData', (key) => undefined);
+    let insertCalls = 0;
+    mock('BigQuery', {
+      insert: (connection, rows, options, onSuccess, onFailure) => {
+        insertCalls = insertCalls + 1;
+        onFailure([{ message: 'transient error' }]);
+      }
+    });
+    runCode(mockData);
+    assertApi('gtmOnSuccess').wasCalled();
+    assertThat(insertCalls).isEqualTo(2);
+- name: Self referral is classified as direct not referral
+  code: |-
+    const mockData = {
+      bqProject: 'my-project',
+      bqDataset: 'analytics',
+      bqTable: 'events',
+      eventName: 'page_view'
+    };
+    mock('getAllEventData', {
+      event_name: 'page_view',
+      client_id: '123.456',
+      page_location: 'https://www.weeronline.nl/nederland',
+      page_referrer: 'https://www.weeronline.nl/'
+    });
+    mock('getEventData', (key) => undefined);
+    mock('parseUrl', (url) => {
+      return { hostname: 'www.weeronline.nl', searchParams: {} };
+    });
+    mock('computeEffectiveTldPlusOne', (url) => 'weeronline.nl');
+    let insertedRow;
+    mock('BigQuery', {
+      insert: (connection, rows, options, onSuccess, onFailure) => {
+        insertedRow = rows[0];
+        onSuccess();
+      }
+    });
+    runCode(mockData);
+    assertApi('gtmOnSuccess').wasCalled();
+    assertThat(insertedRow.source).isEqualTo('(direct)');
+    assertThat(insertedRow.medium).isEqualTo('(none)');
 
 
 ___NOTES___
 
-Created on 1-11-2025, 13:46:18
+Created on 1-11-2025, 13:46:18 by Freek Kampen, New North Digital.
 
 
