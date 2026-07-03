@@ -13,7 +13,7 @@ ___INFO___
   "id": "cvt_temp_public_id",
   "version": 1,
   "securityGroups": [],
-  "displayName": "BigQuery Event Tag by New North Digital",
+  "displayName": "BigQuery Event Tag by New North",
   "categories": ["DATA_WAREHOUSING", "ANALYTICS"],
   "brand": {
     "id": "brand_dummy",
